@@ -23,6 +23,8 @@
 
 set -euo pipefail
 
+ORIGINAL_ARGS=("$@")
+
 TARGET=""
 TIMING=""
 OUTPUT_DIR="nmap"
@@ -85,9 +87,17 @@ EOF
 
 require_sudo() {
     if [[ "${EUID}" -ne 0 ]]; then
-        echo "[!] This script must be run with sudo."
-        echo "    Example: sudo $0 -t 192.168.1.0/24 -T4"
-        exit 1
+        echo "[!] Root privileges are required for this Nmap scan."
+        echo "[+] Re-running with sudo..."
+
+        exec sudo -E \
+            TOOLBOX_PROFILE="${TOOLBOX_PROFILE:-}" \
+            TOOLBOX_THREADS="${TOOLBOX_THREADS:-}" \
+            TOOLBOX_RATE_LIMIT="${TOOLBOX_RATE_LIMIT:-}" \
+            TOOLBOX_TIMEOUT="${TOOLBOX_TIMEOUT:-}" \
+            TOOLBOX_SLEEP="${TOOLBOX_SLEEP:-}" \
+            TOOLBOX_NMAP_TIMING="${TOOLBOX_NMAP_TIMING:-}" \
+            "$0" "${ORIGINAL_ARGS[@]}"
     fi
 }
 

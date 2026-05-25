@@ -1,0 +1,17 @@
+output/
+results/
+reports/
+nmap/
+*.gnmap
+*.nmap
+*.xml
+*.log
+*.json
+*.csv
+*.html
+.env
+*.key
+*.pem
+*.p12
+*.pcap
+*.pcapng

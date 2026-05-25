@@ -1,213 +1,382 @@
 #!/usr/bin/env bash
 
-# Reads Nmap .gnmap files, extracts open TCP ports, builds HTTP/HTTPS URLs,
-# runs httpx to collect status codes and screenshots, optionally saves curl responses,
-# supports web-only filtering, scan profiles, and generates an HTML report.
+# Performs a two-step TCP Nmap scan:
+# 1. Scans all TCP ports with -p- -Pn --open to find open ports even if ICMP is blocked.
+# 2. Runs -sC -sV only against the open ports found for each host.
+# 3. If Nmap files already exist, asks whether to reuse them or redo the scan.
+# 4. Generates risk-enriched Markdown/CSV summaries.
 #
 # Options:
-#   -i, --input           Directory containing Nmap .gnmap files. Default: nmap
-#   -o, --output          Output directory. Default: httpx-output
-#   --curl-response       Also save curl response headers and bodies.
-#   --scheme              Scheme mode: both, http, or https. Default: both
-#   --timeout             Timeout in seconds. Overrides profile timeout.
-#   --profile             quiet, balanced, or fast. Default: balanced
-#   --web-only            Only test ports/services likely to be HTTP/HTTPS.
-#   -h, --help            Show help message.
+#   -t, --target   Target IP, hostname, CIDR, range, or comma-separated targets.
+#   -T, --timing   Nmap timing value from 0 to 5. Example: -T4, -T 4, or --timing=4
+#   -o, --output   Output directory. Default: nmap
+#   -f, --force    Redo scans even if output files already exist. No prompt.
+#   --reuse        Reuse existing scans if found. No prompt.
+#   -h, --help     Show help message.
 #
 # Examples:
-#   ./httpx-screenshot-open-ports.sh -i nmap
-#   ./httpx-screenshot-open-ports.sh -i nmap --web-only
-#   ./httpx-screenshot-open-ports.sh -i nmap --profile quiet
-#   ./httpx-screenshot-open-ports.sh -i nmap --profile fast --curl-response
-#   ./httpx-screenshot-open-ports.sh -i nmap -o web-evidence --scheme https
+#   sudo ./scan-ips-then-open-ports.sh -t 192.168.1.0/24 -T4
+#   sudo ./scan-ips-then-open-ports.sh -t '192.168.55.2-230' -T2 -o scans
+#   sudo ./scan-ips-then-open-ports.sh -t '192.168.174.62,192.168.174.60' -T4
+#   sudo ./scan-ips-then-open-ports.sh -t 10.10.10.5 -T4 --force
+#   sudo ./scan-ips-then-open-ports.sh -t 10.10.10.5 -T4 --reuse
 
 set -euo pipefail
 
-INPUT_DIR="nmap"
-OUTPUT_DIR="httpx-output"
-SCHEME_MODE="both"
-PROFILE="balanced"
-TIMEOUT=""
-CURL_RESPONSE=false
-WEB_ONLY=false
+TARGET=""
+TIMING=""
+OUTPUT_DIR="nmap"
+FORCE=false
+REUSE=false
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-HTTPX_RATE_LIMIT=""
-HTTPX_THREADS=""
-CURL_SLEEP=""
-
-TARGETS_FILE=""
-HTTPX_JSON_FILE=""
-HTTPX_TEXT_FILE=""
-CURL_DIR=""
-REPORT_HTML=""
+declare -a NMAP_TARGET_ARGS
 
 show_help() {
     cat << EOF
 Usage:
-  $0 [options]
+  sudo $0 -t <target/range> -T <0-5|T0-T5> [-o output_dir] [--force] [--reuse]
 
 Description:
-  Extracts open TCP ports from Nmap .gnmap files, creates HTTP/HTTPS URLs,
-  runs httpx against them, captures screenshots, prints status codes, and
-  generates an HTML report.
+  Runs a full TCP port scan first, then runs a targeted -sC -sV scan
+  on the open TCP ports found for each discovered host.
 
-Requirements:
-  - ProjectDiscovery httpx
-  - curl
-  - Nmap .gnmap files generated with -oA or -oG
+  The script uses -Pn in both scan phases, meaning Nmap will not rely on
+  ICMP/ping discovery before scanning. This is useful when ICMP is blocked.
+
+  If existing Nmap output files are found, the script asks whether to:
+    r = reuse existing files
+    R = redo the scan
 
 Options:
-  -i, --input <dir>
-      Directory containing Nmap .gnmap files.
-      Default: nmap
+  -t, --target   Target IP, hostname, CIDR, range, or comma-separated targets.
+                 Examples:
+                   192.168.1.10
+                   192.168.1.0/24
+                   192.168.55.2-230
+                   192.168.55.2,192.168.55.100,192.168.55.200
 
-  -o, --output <dir>
-      Directory where httpx results, screenshots, curl responses, and HTML report are saved.
-      Default: httpx-output
+  -T, --timing   Nmap timing template.
+                 Accepted formats:
+                   -T4
+                   -T 4
+                   -T T4
+                   --timing=4
+                   --timing=T4
 
-  --curl-response
-      For each generated URL, run curl and save response headers and body.
+  -o, --output   Output directory.
+                 Default:
+                   nmap
 
-  --scheme <both|http|https>
-      Which URL schemes to test.
-      both  = test http:// and https:// for each host:port
-      http  = test only http://
-      https = test only https://
-      Default: both
+  -f, --force    Redo scans even if output files already exist. No prompt.
 
-  --profile <quiet|balanced|fast>
-      Controls scan intensity.
+  --reuse        Reuse existing scans if found. No prompt.
 
-      quiet:
-        Lower concurrency and rate.
-        Better for sensitive environments.
-
-      balanced:
-        Good default for normal internal assessments.
-
-      fast:
-        Higher concurrency and rate.
-        Better when speed matters and alerting/noise is acceptable.
-
-      Default: balanced
-
-  --timeout <seconds>
-      Timeout used by httpx and curl.
-      Overrides the timeout chosen by the profile.
-
-  --web-only
-      Only test ports/services that are likely to be HTTP/HTTPS.
-      This reduces noise by avoiding obvious non-web services such as SSH, SMB, RDP, etc.
-
-  -h, --help
-      Show this help message.
+  -h, --help     Show this help message.
 
 Examples:
-  $0 -i nmap
-  $0 -i nmap --web-only
-  $0 -i nmap --profile quiet
-  $0 -i nmap --profile fast --curl-response
-  $0 -i nmap -o web-evidence --scheme https
-  $0 -i nmap --web-only --profile quiet --curl-response
+  sudo $0 -t 192.168.1.0/24 -T4
+  sudo $0 -t '192.168.55.2-230' -T2 -o nmap_internal
+  sudo $0 -t '192.168.174.62,192.168.174.60' -T4
+  sudo $0 -t 10.10.10.5 -T4 --force
+  sudo $0 -t 10.10.10.5 -T4 --reuse
 EOF
 }
 
+require_sudo() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        echo "[!] This script must be run with sudo."
+        echo "    Example: sudo $0 -t 192.168.1.0/24 -T4"
+        exit 1
+    fi
+}
+
 check_dependencies() {
-    if ! command -v httpx >/dev/null 2>&1; then
-        echo "[!] httpx is not installed or not in PATH."
-        echo "    Install ProjectDiscovery httpx first."
+    if ! command -v nmap >/dev/null 2>&1; then
+        echo "[!] nmap is not installed or not in PATH."
+        exit 1
+    fi
+}
+
+normalize_timing() {
+    local input="$1"
+
+    input="${input#-}"   # Converts -T4 to T4
+    input="${input#T}"   # Converts T4 to 4
+
+    if [[ ! "$input" =~ ^[0-5]$ ]]; then
+        echo "[!] Invalid timing value: $1"
+        echo "    Use one of: 0,1,2,3,4,5 or T0,T1,T2,T3,T4,T5 or -T4"
         exit 1
     fi
 
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "[!] curl is not installed or not in PATH."
-        exit 1
-    fi
+    TIMING="-T${input}"
 }
 
 safe_name() {
-    echo "$1" | sed 's#[/:*?<>|,=&?%# ]#_#g'
+    echo "$1" | sed 's#[/:*?<>|, ]#_#g'
 }
 
-html_escape() {
-    sed \
-        -e 's/&/\&amp;/g' \
-        -e 's/</\&lt;/g' \
-        -e 's/>/\&gt;/g' \
-        -e 's/"/\&quot;/g' \
-        -e "s/'/\&#39;/g"
-}
+prepare_targets() {
+    NMAP_TARGET_ARGS=()
 
-validate_options() {
-    if [[ ! -d "$INPUT_DIR" ]]; then
-        echo "[!] Input directory does not exist: $INPUT_DIR"
-        exit 1
+    if [[ "$TARGET" == *","* ]]; then
+        IFS=',' read -r -a raw_targets <<< "$TARGET"
+
+        for raw_target in "${raw_targets[@]}"; do
+            cleaned_target="$(echo "$raw_target" | xargs)"
+
+            if [[ -n "$cleaned_target" ]]; then
+                NMAP_TARGET_ARGS+=("$cleaned_target")
+            fi
+        done
+    else
+        NMAP_TARGET_ARGS+=("$TARGET")
     fi
 
-    if [[ "$SCHEME_MODE" != "both" && "$SCHEME_MODE" != "http" && "$SCHEME_MODE" != "https" ]]; then
-        echo "[!] Invalid scheme mode: $SCHEME_MODE"
-        echo "    Use: both, http, or https"
-        exit 1
-    fi
-
-    if [[ "$PROFILE" != "quiet" && "$PROFILE" != "balanced" && "$PROFILE" != "fast" ]]; then
-        echo "[!] Invalid profile: $PROFILE"
-        echo "    Use: quiet, balanced, or fast"
-        exit 1
-    fi
-
-    if [[ -n "$TIMEOUT" && ! "$TIMEOUT" =~ ^[0-9]+$ ]]; then
-        echo "[!] Timeout must be a number."
+    if [[ "${#NMAP_TARGET_ARGS[@]}" -eq 0 ]]; then
+        echo "[!] No valid targets were provided."
         exit 1
     fi
 }
 
-apply_profile() {
-    case "$PROFILE" in
-        quiet)
-            HTTPX_RATE_LIMIT="5"
-            HTTPX_THREADS="5"
-            CURL_SLEEP="0.50"
-            [[ -z "$TIMEOUT" ]] && TIMEOUT="15"
-            ;;
-        balanced)
-            HTTPX_RATE_LIMIT="25"
-            HTTPX_THREADS="25"
-            CURL_SLEEP="0.10"
-            [[ -z "$TIMEOUT" ]] && TIMEOUT="10"
-            ;;
-        fast)
-            HTTPX_RATE_LIMIT="100"
-            HTTPX_THREADS="100"
-            CURL_SLEEP="0"
-            [[ -z "$TIMEOUT" ]] && TIMEOUT="5"
-            ;;
-    esac
-}
+ask_reuse_or_redo() {
+    local scan_label="$1"
+    local file_prefix="$2"
+    local answer=""
 
-is_likely_web_service() {
-    local port="$1"
-    local service="$2"
-    local service_l
-    service_l="$(echo "$service" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$FORCE" == true ]]; then
+        return 1
+    fi
 
-    case "$port" in
-        80|81|88|443|591|593|8000|8008|8080|8081|8082|8088|8090|8180|8443|8834|8888|9000|9001|9080|9443|9999|10000)
-            return 0
-            ;;
-    esac
-
-    if [[ "$service_l" == *"http"* || "$service_l" == *"https"* || "$service_l" == *"ssl/http"* || "$service_l" == *"http-proxy"* ]]; then
+    if [[ "$REUSE" == true ]]; then
         return 0
     fi
 
-    return 1
+    if [[ ! -t 0 && ! -r /dev/tty ]]; then
+        echo "[!] Existing files found, but no interactive terminal is available."
+        echo "    Use --force to redo scans or --reuse to reuse existing files."
+        exit 1
+    fi
+
+    while true; do
+        echo "" > /dev/tty
+        echo "[?] Existing Nmap files found for: $scan_label" > /dev/tty
+        echo "    ${file_prefix}.nmap" > /dev/tty
+        echo "    ${file_prefix}.gnmap" > /dev/tty
+        echo "    ${file_prefix}.xml" > /dev/tty
+        echo "" > /dev/tty
+        echo "    Do you want to reuse the existing Nmap files or redo the scan?" > /dev/tty
+        echo "    r = reuse existing files" > /dev/tty
+        echo "    R = redo scan" > /dev/tty
+        printf "Choice [r/R]: " > /dev/tty
+
+        read -r answer < /dev/tty
+
+        case "$answer" in
+            r|reuse|Reuse|REUSE)
+                echo "[+] Reusing existing scan files for: $scan_label"
+                return 0
+                ;;
+            R|redo|Redo|REDO)
+                echo "[+] Redoing scan for: $scan_label"
+                return 1
+                ;;
+            *)
+                echo "[!] Invalid choice. Enter 'r' to reuse or 'R' to redo." > /dev/tty
+                ;;
+        esac
+    done
 }
 
-extract_open_targets_from_gnmap() {
+parse_open_ports_from_gnmap() {
     local gnmap_file="$1"
 
     awk '
+    /Ports:/ {
+        host=$2
+        ports=""
+
+        split($0, parts, "Ports: ")
+        split(parts[2], entries, ", ")
+
+        for (i in entries) {
+            split(entries[i], field, "/")
+
+            port=field[1]
+            state=field[2]
+            proto=field[3]
+
+            if (state == "open" && proto == "tcp") {
+                if (ports == "") {
+                    ports = port
+                } else {
+                    ports = ports "," port
+                }
+            }
+        }
+
+        if (ports != "") {
+            print host " " ports
+        }
+    }
+    ' "$gnmap_file"
+}
+
+write_summary_header() {
+    local md_file="$1"
+    local csv_file="$2"
+
+    cat > "$md_file" << EOF
+# Nmap TCP Scan Summary
+
+## Scan Context
+
+| Field | Value |
+|---|---|
+| Target | \`$TARGET\` |
+| Parsed targets | \`${NMAP_TARGET_ARGS[*]}\` |
+| Timing | \`$TIMING\` |
+| Host discovery | \`-Pn\` used, ICMP/ping discovery bypassed |
+| Full TCP discovery | \`-p- -Pn --open\` |
+| Service detection | \`-sC -sV -Pn\` |
+| Existing file behavior | Interactive prompt unless \`--force\` or \`--reuse\` is used |
+| Force rerun | \`$FORCE\` |
+| Auto reuse | \`$REUSE\` |
+| Output directory | \`$OUTPUT_DIR\` |
+| Summary timestamp | \`$TIMESTAMP\` |
+
+## Executive Summary
+
+This scan identified TCP services exposed by the tested target scope. A first pass scanned all TCP ports and a second pass performed service and default script detection only against confirmed open ports.
+
+The risk level below is an automated prioritization aid. It does not replace manual validation by the tester.
+
+## Open Services With Risk-Oriented Enrichment
+
+| Host | Port | State | Service | Risk | Review Note | Raw Nmap Details |
+|---|---:|---|---|---|---|---|
+EOF
+
+    echo "host,port,protocol,state,service,risk,review_note,raw_nmap_details" > "$csv_file"
+}
+
+write_summary_footer() {
+    local md_file="$1"
+
+    cat >> "$md_file" << EOF
+
+## Risk Interpretation
+
+| Risk | Meaning |
+|---|---|
+| High | Usually deserves priority review because it may expose administration, identity, file sharing, databases, or sensitive remote access. |
+| Medium | Commonly relevant service that may require configuration, version, authentication, or exposure review. |
+| Low | Usually lower priority from port exposure alone, but still needs validation in context. |
+| Info | Informational or unidentified service requiring manual triage. |
+
+## Recommended Follow-Up
+
+- Validate whether each exposed service is expected and authorized.
+- Prioritize externally exposed administrative services such as SSH, RDP, WinRM, SMB, database ports, and management interfaces.
+- Review service versions for known vulnerabilities.
+- Confirm whether sensitive services are restricted by firewall rules or network segmentation.
+- Run targeted service-specific checks only where authorized.
+- Manually validate automated risk tags before including them in a client deliverable.
+
+## Notes
+
+This summary is generated automatically from Nmap grepable output. It should be reviewed by the tester before being included in a client-facing report.
+EOF
+}
+
+extract_services_from_gnmap() {
+    local gnmap_file="$1"
+    local csv_file="$2"
+    local md_file="$3"
+
+    awk -v csv="$csv_file" -v md="$md_file" '
+    function csv_escape(value) {
+        gsub(/"/, "\"\"", value)
+        return "\"" value "\""
+    }
+
+    function md_escape(value) {
+        gsub(/\|/, "\\|", value)
+        return value
+    }
+
+    function risk_for(port, service) {
+        service_l=tolower(service)
+
+        if (
+            port == "21"   || port == "22"   || port == "23"   ||
+            port == "25"   || port == "53"   || port == "88"   ||
+            port == "111"  || port == "135"  || port == "139"  ||
+            port == "389"  || port == "445"  || port == "464"  ||
+            port == "593"  || port == "636"  || port == "1433" ||
+            port == "1521" || port == "2049" || port == "2375" ||
+            port == "2376" || port == "3306" || port == "3389" ||
+            port == "5432" || port == "5900" || port == "5985" ||
+            port == "5986" || port == "6379" || port == "6443" ||
+            port == "8080" || port == "8443" || port == "9200" ||
+            port == "9300" || port == "11211" || port == "27017"
+        ) {
+            return "High"
+        }
+
+        if (
+            port == "80"   || port == "443"  || port == "8000" ||
+            port == "8081" || port == "8888" || service_l ~ /http/ ||
+            service_l ~ /ssl/ || service_l ~ /https/
+        ) {
+            return "Medium"
+        }
+
+        if (service_l == "unknown" || service_l == "") {
+            return "Info"
+        }
+
+        return "Low"
+    }
+
+    function note_for(port, service) {
+        service_l=tolower(service)
+
+        if (port == "21") return "FTP exposed; verify anonymous access, cleartext authentication, and write permissions."
+        if (port == "22") return "SSH exposed; verify access control, password login, weak algorithms, and brute-force protection."
+        if (port == "23") return "Telnet exposed; cleartext remote administration should be reviewed urgently."
+        if (port == "25") return "SMTP exposed; check relay risk, banner leakage, TLS, and mail security configuration."
+        if (port == "53") return "DNS exposed; check zone transfer, recursion, and exposure scope."
+        if (port == "88" || port == "464") return "Kerberos exposed; review domain exposure and authentication hardening."
+        if (port == "111" || port == "2049") return "RPC/NFS exposed; verify exported shares and access restrictions."
+        if (port == "135" || port == "139" || port == "445") return "Windows file sharing/RPC exposed; prioritize SMB signing, null sessions, shares, and lateral movement risk."
+        if (port == "389" || port == "636") return "LDAP exposed; check anonymous bind, TLS, directory exposure, and access control."
+        if (port == "1433") return "MSSQL exposed; verify authentication, patch level, and network restrictions."
+        if (port == "1521") return "Oracle listener exposed; verify listener hardening, authentication, and patch level."
+        if (port == "2375" || port == "2376") return "Docker API exposed; unauthenticated Docker access can lead to host compromise."
+        if (port == "3306") return "MySQL/MariaDB exposed; verify authentication, patch level, and network restrictions."
+        if (port == "3389") return "RDP exposed; verify MFA, NLA, lockout policy, and exposure scope."
+        if (port == "5432") return "PostgreSQL exposed; verify authentication, patch level, and network restrictions."
+        if (port == "5900") return "VNC exposed; verify authentication and encryption."
+        if (port == "5985" || port == "5986") return "WinRM exposed; verify administrative access control and authentication policy."
+        if (port == "6379") return "Redis exposed; verify authentication, protected mode, and network restrictions."
+        if (port == "6443") return "Kubernetes API exposed; verify authentication, authorization, and network exposure."
+        if (port == "9200" || port == "9300") return "Elasticsearch exposed; verify authentication and data exposure risk."
+        if (port == "11211") return "Memcached exposed; verify access restrictions and amplification risk."
+        if (port == "27017") return "MongoDB exposed; verify authentication and data exposure risk."
+
+        if (port == "80" || port == "443" || port == "8000" || port == "8080" || port == "8081" || port == "8443" || port == "8888" || service_l ~ /http/) {
+            return "Web service exposed; review TLS, authentication, headers, directories, default pages, and application attack surface."
+        }
+
+        if (service_l == "unknown" || service_l == "") {
+            return "Unknown service; manually fingerprint and validate business purpose."
+        }
+
+        return "Review service exposure, version, authentication, and business justification."
+    }
+
     /Ports:/ {
         host=$2
 
@@ -227,302 +396,63 @@ extract_open_targets_from_gnmap() {
                     service="unknown"
                 }
 
-                print host "|" port "|" service
+                raw=entries[i]
+                risk=risk_for(port, service)
+                note=note_for(port, service)
+
+                print host "," port "," proto "," state "," service "," risk "," csv_escape(note) "," csv_escape(raw) >> csv
+
+                print "| " md_escape(host) " | " port "/" proto " | " state " | " md_escape(service) " | " risk " | " md_escape(note) " | `" md_escape(raw) "` |" >> md
             }
         }
     }
     ' "$gnmap_file"
 }
 
-build_urls() {
-    local host="$1"
-    local port="$2"
-
-    case "$SCHEME_MODE" in
-        both)
-            echo "http://${host}:${port}"
-            echo "https://${host}:${port}"
-            ;;
-        http)
-            echo "http://${host}:${port}"
-            ;;
-        https)
-            echo "https://${host}:${port}"
-            ;;
-    esac
-}
-
-save_curl_responses() {
-    local url="$1"
-    local name
-    name="$(safe_name "$url")"
-
-    local body_file="${CURL_DIR}/${name}.body.txt"
-    local headers_file="${CURL_DIR}/${name}.headers.txt"
-
-    echo "[+] Curling: $url"
-
-    curl \
-        --silent \
-        --show-error \
-        --location \
-        --max-time "$TIMEOUT" \
-        --insecure \
-        --dump-header "$headers_file" \
-        --output "$body_file" \
-        "$url" || true
-
-    if [[ "$CURL_SLEEP" != "0" ]]; then
-        sleep "$CURL_SLEEP"
-    fi
-}
-
-run_httpx() {
-    echo "[+] Running httpx screenshots and status-code collection..."
-    echo "[+] Profile: $PROFILE"
-    echo "[+] httpx rate limit: $HTTPX_RATE_LIMIT"
-    echo "[+] httpx threads: $HTTPX_THREADS"
-    echo "[+] timeout: $TIMEOUT"
-
-    httpx \
-        -l "$TARGETS_FILE" \
-        -status-code \
-        -title \
-        -tech-detect \
-        -web-server \
-        -follow-redirects \
-        -timeout "$TIMEOUT" \
-        -rate-limit "$HTTPX_RATE_LIMIT" \
-        -threads "$HTTPX_THREADS" \
-        -screenshot \
-        -screenshot-output "$OUTPUT_DIR/screenshots" \
-        -json \
-        -o "$HTTPX_JSON_FILE" \
-        | tee "$HTTPX_TEXT_FILE" || true
-
-    echo "[+] httpx completed."
-}
-
-json_value() {
-    local key="$1"
-    local line="$2"
-
-    echo "$line" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p"
-}
-
-json_number() {
-    local key="$1"
-    local line="$2"
-
-    echo "$line" | sed -nE "s/.*\"$key\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p"
-}
-
-find_screenshot_for_url() {
-    local url="$1"
-    local safe
-    safe="$(safe_name "$url")"
-
-    local found=""
-
-    found="$(find "$OUTPUT_DIR/screenshots" -type f \( -name "*.png" -o -name "*.jpeg" -o -name "*.jpg" \) 2>/dev/null | grep -i "$safe" | head -n 1 || true)"
-
-    if [[ -z "$found" ]]; then
-        found="$(find "$OUTPUT_DIR/screenshots" -type f \( -name "*.png" -o -name "*.jpeg" -o -name "*.jpg" \) 2>/dev/null | head -n 1 || true)"
-    fi
-
-    echo "$found"
-}
-
-generate_html_report() {
-    echo "[+] Generating HTML report..."
-
-    cat > "$REPORT_HTML" << EOF
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>HTTPX Web Exposure Report</title>
-<style>
-body {
-    font-family: Arial, sans-serif;
-    margin: 24px;
-    background: #f7f7f7;
-    color: #222;
-}
-h1, h2 {
-    color: #111;
-}
-.summary {
-    background: white;
-    padding: 16px;
-    border-radius: 8px;
-    margin-bottom: 20px;
-    border: 1px solid #ddd;
-}
-.card {
-    background: white;
-    border: 1px solid #ddd;
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 18px;
-}
-.meta {
-    font-size: 14px;
-    color: #444;
-}
-.status {
-    display: inline-block;
-    padding: 4px 8px;
-    border-radius: 4px;
-    background: #eee;
-    font-weight: bold;
-}
-img {
-    max-width: 100%;
-    border: 1px solid #ccc;
-    margin-top: 12px;
-}
-code {
-    background: #eee;
-    padding: 2px 4px;
-    border-radius: 4px;
-}
-a {
-    color: #0645ad;
-}
-table {
-    border-collapse: collapse;
-}
-td, th {
-    padding: 6px 10px;
-    border: 1px solid #ddd;
-}
-</style>
-</head>
-<body>
-
-<h1>HTTPX Web Exposure Report</h1>
-
-<div class="summary">
-<h2>Scan Context</h2>
-<table>
-<tr><th>Input directory</th><td><code>$INPUT_DIR</code></td></tr>
-<tr><th>Output directory</th><td><code>$OUTPUT_DIR</code></td></tr>
-<tr><th>Scheme mode</th><td><code>$SCHEME_MODE</code></td></tr>
-<tr><th>Profile</th><td><code>$PROFILE</code></td></tr>
-<tr><th>Timeout</th><td><code>$TIMEOUT</code></td></tr>
-<tr><th>Web-only mode</th><td><code>$WEB_ONLY</code></td></tr>
-<tr><th>Curl response capture</th><td><code>$CURL_RESPONSE</code></td></tr>
-<tr><th>Generated targets</th><td><code>$(wc -l < "$TARGETS_FILE" | xargs)</code></td></tr>
-</table>
-</div>
-
-<h2>Discovered Web Services</h2>
-EOF
-
-    if [[ ! -s "$HTTPX_JSON_FILE" ]]; then
-        cat >> "$REPORT_HTML" << EOF
-<div class="card">
-<p>No responsive HTTP/HTTPS services were recorded by httpx.</p>
-</div>
-EOF
-    else
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-
-            local url status title tech webserver screenshot rel_screenshot
-            url="$(json_value "url" "$line")"
-            status="$(json_number "status_code" "$line")"
-            title="$(json_value "title" "$line")"
-            webserver="$(json_value "webserver" "$line")"
-            tech="$(json_value "tech" "$line")"
-
-            [[ -z "$url" ]] && url="unknown"
-            [[ -z "$status" ]] && status="unknown"
-            [[ -z "$title" ]] && title="N/A"
-            [[ -z "$webserver" ]] && webserver="N/A"
-            [[ -z "$tech" ]] && tech="N/A"
-
-            screenshot="$(find_screenshot_for_url "$url")"
-            rel_screenshot=""
-
-            if [[ -n "$screenshot" ]]; then
-                rel_screenshot="${screenshot#"$OUTPUT_DIR"/}"
-            fi
-
-            local url_html title_html webserver_html tech_html
-            url_html="$(printf "%s" "$url" | html_escape)"
-            title_html="$(printf "%s" "$title" | html_escape)"
-            webserver_html="$(printf "%s" "$webserver" | html_escape)"
-            tech_html="$(printf "%s" "$tech" | html_escape)"
-
-            cat >> "$REPORT_HTML" << EOF
-<div class="card">
-<h3><a href="$url_html" target="_blank">$url_html</a></h3>
-<p class="meta">
-<span class="status">Status: $status</span><br>
-<strong>Title:</strong> $title_html<br>
-<strong>Web server:</strong> $webserver_html<br>
-<strong>Technologies:</strong> $tech_html
-</p>
-EOF
-
-            if [[ -n "$rel_screenshot" ]]; then
-                cat >> "$REPORT_HTML" << EOF
-<p><strong>Screenshot:</strong> <code>$rel_screenshot</code></p>
-<img src="$rel_screenshot" alt="Screenshot for $url_html">
-EOF
-            else
-                cat >> "$REPORT_HTML" << EOF
-<p><strong>Screenshot:</strong> Not found or not generated.</p>
-EOF
-            fi
-
-            if [[ "$CURL_RESPONSE" == true ]]; then
-                local curl_name body_file headers_file
-                curl_name="$(safe_name "$url")"
-                body_file="curl-responses/${curl_name}.body.txt"
-                headers_file="curl-responses/${curl_name}.headers.txt"
-
-                cat >> "$REPORT_HTML" << EOF
-<p>
-<strong>Curl artifacts:</strong>
-<a href="$headers_file" target="_blank">headers</a> |
-<a href="$body_file" target="_blank">body</a>
-</p>
-EOF
-            fi
-
-            cat >> "$REPORT_HTML" << EOF
-</div>
-EOF
-
-        done < "$HTTPX_JSON_FILE"
-    fi
-
-    cat >> "$REPORT_HTML" << EOF
-
-</body>
-</html>
-EOF
-
-    echo "[+] HTML report generated: $REPORT_HTML"
-}
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -i|--input)
-            INPUT_DIR="${2:-}"
+        -t|--target)
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            TARGET="$2"
             shift 2
             ;;
 
-        --input=*)
-            INPUT_DIR="${1#*=}"
+        --target=*)
+            TARGET="${1#*=}"
+            shift
+            ;;
+
+        -T|--timing)
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            normalize_timing "$2"
+            shift 2
+            ;;
+
+        -T[0-5])
+            normalize_timing "$1"
+            shift
+            ;;
+
+        --timing=*)
+            normalize_timing "${1#*=}"
             shift
             ;;
 
         -o|--output)
-            OUTPUT_DIR="${2:-}"
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            OUTPUT_DIR="$2"
             shift 2
             ;;
 
@@ -531,43 +461,13 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
-        --curl-response)
-            CURL_RESPONSE=true
+        -f|--force)
+            FORCE=true
             shift
             ;;
 
-        --scheme)
-            SCHEME_MODE="${2:-}"
-            shift 2
-            ;;
-
-        --scheme=*)
-            SCHEME_MODE="${1#*=}"
-            shift
-            ;;
-
-        --timeout)
-            TIMEOUT="${2:-}"
-            shift 2
-            ;;
-
-        --timeout=*)
-            TIMEOUT="${1#*=}"
-            shift
-            ;;
-
-        --profile)
-            PROFILE="${2:-}"
-            shift 2
-            ;;
-
-        --profile=*)
-            PROFILE="${1#*=}"
-            shift
-            ;;
-
-        --web-only)
-            WEB_ONLY=true
+        --reuse)
+            REUSE=true
             shift
             ;;
 
@@ -584,103 +484,119 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+require_sudo
 check_dependencies
-validate_options
-apply_profile
 
-mkdir -p "$OUTPUT_DIR"
-mkdir -p "$OUTPUT_DIR/screenshots"
-
-TARGETS_FILE="${OUTPUT_DIR}/httpx_targets.txt"
-HTTPX_JSON_FILE="${OUTPUT_DIR}/httpx_results.json"
-HTTPX_TEXT_FILE="${OUTPUT_DIR}/httpx_results.txt"
-CURL_DIR="${OUTPUT_DIR}/curl-responses"
-REPORT_HTML="${OUTPUT_DIR}/report.html"
-
-if [[ "$CURL_RESPONSE" == true ]]; then
-    mkdir -p "$CURL_DIR"
-fi
-
-: > "$TARGETS_FILE"
-
-echo "[+] Input Nmap directory: $INPUT_DIR"
-echo "[+] Output directory: $OUTPUT_DIR"
-echo "[+] Scheme mode: $SCHEME_MODE"
-echo "[+] Profile: $PROFILE"
-echo "[+] Web-only mode: $WEB_ONLY"
-echo "[+] Timeout: $TIMEOUT"
-echo "[+] Curl responses: $CURL_RESPONSE"
-
-GNMAP_COUNT=0
-CANDIDATE_COUNT=0
-SKIPPED_NON_WEB_COUNT=0
-
-while IFS= read -r -d '' gnmap_file; do
-    GNMAP_COUNT=$((GNMAP_COUNT + 1))
-    echo "[+] Parsing: $gnmap_file"
-
-    while IFS='|' read -r host port service; do
-        [[ -z "${host:-}" || -z "${port:-}" ]] && continue
-
-        CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
-
-        if [[ "$WEB_ONLY" == true ]]; then
-            if ! is_likely_web_service "$port" "$service"; then
-                SKIPPED_NON_WEB_COUNT=$((SKIPPED_NON_WEB_COUNT + 1))
-                continue
-            fi
-        fi
-
-        while read -r url; do
-            [[ -z "$url" ]] && continue
-            echo "$url" >> "$TARGETS_FILE"
-        done < <(build_urls "$host" "$port")
-
-    done < <(extract_open_targets_from_gnmap "$gnmap_file")
-
-done < <(find "$INPUT_DIR" -type f -name "*.gnmap" -print0)
-
-if [[ "$GNMAP_COUNT" -eq 0 ]]; then
-    echo "[!] No .gnmap files found in: $INPUT_DIR"
+if [[ "$FORCE" == true && "$REUSE" == true ]]; then
+    echo "[!] --force and --reuse cannot be used together."
     exit 1
 fi
 
-sort -u "$TARGETS_FILE" -o "$TARGETS_FILE"
+if [[ -z "$TARGET" ]]; then
+    echo "[!] Missing target."
+    show_help
+    exit 1
+fi
 
-TARGET_COUNT="$(wc -l < "$TARGETS_FILE" | xargs)"
+if [[ -z "$TIMING" ]]; then
+    echo "[!] Missing timing value."
+    show_help
+    exit 1
+fi
 
-echo "[+] Parsed .gnmap files: $GNMAP_COUNT"
-echo "[+] Open TCP services found: $CANDIDATE_COUNT"
-echo "[+] Skipped by --web-only: $SKIPPED_NON_WEB_COUNT"
-echo "[+] Generated HTTP/HTTPS targets: $TARGET_COUNT"
+mkdir -p "$OUTPUT_DIR"
 
-if [[ "$TARGET_COUNT" -eq 0 ]]; then
-    echo "[!] No HTTP/HTTPS targets generated."
-    echo "    If you used --web-only, try again without it."
+prepare_targets
+
+TARGET_SAFE="$(safe_name "$TARGET")"
+
+DISCOVERY_PREFIX="${OUTPUT_DIR}/${TARGET_SAFE}_tcp_full"
+DISCOVERY_GNMAP="${DISCOVERY_PREFIX}.gnmap"
+
+SUMMARY_MD="${OUTPUT_DIR}/summary_${TIMESTAMP}.md"
+SUMMARY_CSV="${OUTPUT_DIR}/summary_${TIMESTAMP}.csv"
+
+write_summary_header "$SUMMARY_MD" "$SUMMARY_CSV"
+
+echo "[+] Target: $TARGET"
+echo "[+] Parsed Nmap targets: ${NMAP_TARGET_ARGS[*]}"
+echo "[+] Timing: $TIMING"
+echo "[+] Output directory: $OUTPUT_DIR"
+echo "[+] ICMP/ping discovery bypass: enabled with -Pn"
+echo "[+] Existing file behavior: ask unless --force or --reuse is used"
+echo "[+] Force rerun: $FORCE"
+echo "[+] Auto reuse: $REUSE"
+
+if [[ -f "$DISCOVERY_GNMAP" ]]; then
+    if ask_reuse_or_redo "full TCP discovery scan" "$DISCOVERY_PREFIX"; then
+        :
+    else
+        echo "[+] Starting full TCP port discovery..."
+        nmap -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+    fi
+else
+    echo "[+] Starting full TCP port discovery..."
+    nmap -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+fi
+
+if [[ ! -f "$DISCOVERY_GNMAP" ]]; then
+    echo "[!] Expected grepable output not found: $DISCOVERY_GNMAP"
+    exit 1
+fi
+
+echo "[+] Parsing open ports from: $DISCOVERY_GNMAP"
+
+OPEN_HOSTS_FOUND=0
+
+while read -r HOST PORTS; do
+    [[ -z "${HOST:-}" || -z "${PORTS:-}" ]] && continue
+
+    OPEN_HOSTS_FOUND=1
+
+    HOST_SAFE="$(safe_name "$HOST")"
+    SERVICE_PREFIX="${OUTPUT_DIR}/${HOST_SAFE}_tcp_services"
+    SERVICE_GNMAP="${SERVICE_PREFIX}.gnmap"
+
+    echo "[+] Host $HOST has open TCP ports: $PORTS"
+
+    if [[ -f "$SERVICE_GNMAP" ]]; then
+        if ask_reuse_or_redo "service scan for $HOST" "$SERVICE_PREFIX"; then
+            :
+        else
+            echo "[+] Starting service/script scan for $HOST..."
+            nmap -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
+        fi
+    else
+        echo "[+] Starting service/script scan for $HOST..."
+        nmap -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
+    fi
+
+    if [[ -f "$SERVICE_GNMAP" ]]; then
+        extract_services_from_gnmap "$SERVICE_GNMAP" "$SUMMARY_CSV" "$SUMMARY_MD"
+    else
+        echo "[!] Service scan output not found for $HOST: $SERVICE_GNMAP"
+    fi
+
+done < <(parse_open_ports_from_gnmap "$DISCOVERY_GNMAP")
+
+if [[ "$OPEN_HOSTS_FOUND" -eq 0 ]]; then
+    cat >> "$SUMMARY_MD" << EOF
+| No hosts with open TCP ports found | - | - | - | - | - | - |
+EOF
+
+    write_summary_footer "$SUMMARY_MD"
+
+    echo "[+] No open TCP ports found."
+    echo "[+] Summary generated:"
+    echo "    $SUMMARY_MD"
+    echo "    $SUMMARY_CSV"
     exit 0
 fi
 
-echo "[+] Target list:"
-cat "$TARGETS_FILE"
+write_summary_footer "$SUMMARY_MD"
 
-run_httpx
-
-if [[ "$CURL_RESPONSE" == true ]]; then
-    echo "[+] Saving curl responses..."
-
-    while read -r url; do
-        [[ -z "$url" ]] && continue
-        save_curl_responses "$url"
-    done < "$TARGETS_FILE"
-
-    echo "[+] Curl responses saved in: $CURL_DIR"
-fi
-
-generate_html_report
-
-echo "[+] Done."
-echo "[+] Targets file: $TARGETS_FILE"
-echo "[+] httpx text results: $HTTPX_TEXT_FILE"
-echo "[+] httpx JSON results: $HTTPX_JSON_FILE"
-echo "[+] Screenshots directory: $OUTPUT_DIR/screenshots"
-echo "[+] HTML report: $REPORT_HTML"
+echo "[+] All scans completed."
+echo "[+] Results saved in: $OUTPUT_DIR"
+echo "[+] Client-ready summary generated:"
+echo "    $SUMMARY_MD"
+echo "    $SUMMARY_CSV"

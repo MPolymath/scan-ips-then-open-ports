@@ -21,6 +21,8 @@
 #                  Accepts any nmap -p syntax, e.g. 22,80,443,445 or 1-1024.
 #                  Use a small list for staged scans through tunnels, where a
 #                  full 65,535-port sweep of a /24 would take ~a day.
+#   --min-rate <n> Force nmap to send at least <n> packets per second.
+#                  Applied to both scan phases. Example: --min-rate 5000.
 #   --nmap-extra   Extra raw nmap flags appended to both scan phases.
 #                  Example: --nmap-extra "--script-timeout 30"
 #   -h, --help     Show help message.
@@ -44,6 +46,7 @@ REUSE=false
 CONNECT_SCAN=false
 NMAP_EXTRA=""
 PORT_SPEC=""
+MIN_RATE=""
 SCAN_TYPE_ARGS=()
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
@@ -103,6 +106,10 @@ Options:
                    1-1024,3389,5985,5986
                  Use a small list for staged scans through tunnels, where a
                  full 65,535-port sweep of a /24 would take ~a day.
+
+  --min-rate <n> Force nmap to send at least <n> probes per second.
+                 Applied to both scan phases.
+                 Example: --min-rate 5000
 
   --nmap-extra   Extra raw nmap flags appended to both scan phases.
                  Example: --nmap-extra "--script-timeout 30"
@@ -289,6 +296,7 @@ write_summary_header() {
 | Timing | \`$TIMING\` |
 | Scan type | \`$SCAN_TYPE_DESC\` |
 | Port scope | \`${PORT_SCOPE_DESC}\` |
+| Minimum probe rate | \`${MIN_RATE:-nmap default}\` |
 | Host discovery | \`-Pn\` used, ICMP/ping discovery bypassed |
 | TCP discovery | \`nmap -p <scope> -Pn --open\` (scope: ${PORT_SCOPE_DESC}) |
 | Service detection | \`-sC -sV -Pn\` |
@@ -543,6 +551,21 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --min-rate)
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            MIN_RATE="$2"
+            shift 2
+            ;;
+
+        --min-rate=*)
+            MIN_RATE="${1#*=}"
+            shift
+            ;;
+
         --nmap-extra)
             if [[ -z "${2:-}" ]]; then
                 echo "[!] Missing value for $1"
@@ -594,6 +617,16 @@ fi
 if [[ -n "$NMAP_EXTRA" ]]; then
     read -ra nmap_extra_flags <<< "$NMAP_EXTRA"
     SCAN_TYPE_ARGS+=("${nmap_extra_flags[@]}")
+fi
+
+# Optional minimum probe rate (--min-rate), applied to both scan phases.
+if [[ -n "$MIN_RATE" ]]; then
+    if [[ ! "$MIN_RATE" =~ ^[0-9]+$ ]] || (( MIN_RATE < 1 )); then
+        echo "[!] Invalid --min-rate value: $MIN_RATE"
+        echo "    Use a positive number of packets per second, e.g. --min-rate 5000."
+        exit 1
+    fi
+    SCAN_TYPE_ARGS+=(--min-rate "$MIN_RATE")
 fi
 
 # Port scope for the discovery phase: all TCP ports by default, or the
@@ -652,6 +685,9 @@ echo "[+] Parsed Nmap targets: ${NMAP_TARGET_ARGS[*]}"
 echo "[+] Timing: $TIMING"
 echo "[+] Scan type: $SCAN_TYPE_DESC"
 echo "[+] Port scope: $PORT_SCOPE_DESC"
+if [[ -n "$MIN_RATE" ]]; then
+    echo "[+] Minimum probe rate: $MIN_RATE probes/second"
+fi
 if [[ -n "$NMAP_EXTRA" ]]; then
     echo "[+] Extra nmap flags: $NMAP_EXTRA"
 fi

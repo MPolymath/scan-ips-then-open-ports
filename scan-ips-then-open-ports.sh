@@ -17,6 +17,10 @@
 #                  connect() (used by -sT), while root -sS raw packets bypass
 #                  the tunnel and the sudo re-exec strips LD_PRELOAD.
 #                  Auto-enabled when the script runs under proxychains.
+#   --ports <spec> Port scope for the discovery phase. Default: -p- (all ports).
+#                  Accepts any nmap -p syntax, e.g. 22,80,443,445 or 1-1024.
+#                  Use a small list for staged scans through tunnels, where a
+#                  full 65,535-port sweep of a /24 would take ~a day.
 #   --nmap-extra   Extra raw nmap flags appended to both scan phases.
 #                  Example: --nmap-extra "--script-timeout 30"
 #   -h, --help     Show help message.
@@ -39,6 +43,7 @@ FORCE=false
 REUSE=false
 CONNECT_SCAN=false
 NMAP_EXTRA=""
+PORT_SPEC=""
 SCAN_TYPE_ARGS=()
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
@@ -90,6 +95,15 @@ Options:
                  raw packets bypass the tunnel and sudo strips LD_PRELOAD.
                  Auto-enabled when running under proxychains.
 
+  --ports <spec> Port scope for the discovery phase.
+                 Default: -p- (all 65,535 TCP ports).
+                 Accepts any nmap -p syntax:
+                   22,80,443,445,3389
+                   1-1024
+                   1-1024,3389,5985,5986
+                 Use a small list for staged scans through tunnels, where a
+                 full 65,535-port sweep of a /24 would take ~a day.
+
   --nmap-extra   Extra raw nmap flags appended to both scan phases.
                  Example: --nmap-extra "--script-timeout 30"
 
@@ -102,6 +116,7 @@ Examples:
   sudo $0 -t 10.10.10.5 -T4 --force
   sudo $0 -t 10.10.10.5 -T4 --reuse
   proxychains -q $0 -t 192.168.1.0/24 -T3 --connect-scan
+  proxychains -q $0 -t 192.168.1.0/24 -T3 --connect-scan --ports 21,22,80,443,445,3389,5985
 EOF
 }
 
@@ -273,8 +288,9 @@ write_summary_header() {
 | Parsed targets | \`${NMAP_TARGET_ARGS[*]}\` |
 | Timing | \`$TIMING\` |
 | Scan type | \`$SCAN_TYPE_DESC\` |
+| Port scope | \`${PORT_SCOPE_DESC}\` |
 | Host discovery | \`-Pn\` used, ICMP/ping discovery bypassed |
-| Full TCP discovery | \`-p- -Pn --open\` |
+| TCP discovery | \`nmap -p <scope> -Pn --open\` (scope: ${PORT_SCOPE_DESC}) |
 | Service detection | \`-sC -sV -Pn\` |
 | Existing file behavior | Interactive prompt unless \`--force\` or \`--reuse\` is used |
 | Force rerun | \`$FORCE\` |
@@ -512,6 +528,21 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --ports)
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            PORT_SPEC="$2"
+            shift 2
+            ;;
+
+        --ports=*)
+            PORT_SPEC="${1#*=}"
+            shift
+            ;;
+
         --nmap-extra)
             if [[ -z "${2:-}" ]]; then
                 echo "[!] Missing value for $1"
@@ -565,6 +596,17 @@ if [[ -n "$NMAP_EXTRA" ]]; then
     SCAN_TYPE_ARGS+=("${nmap_extra_flags[@]}")
 fi
 
+# Port scope for the discovery phase: all TCP ports by default, or the
+# list/range from --ports (staged scanning through slow tunnels).
+PORT_ARGS=()
+if [[ -n "$PORT_SPEC" ]]; then
+    PORT_ARGS+=(-p "$PORT_SPEC")
+    PORT_SCOPE_DESC="$PORT_SPEC"
+else
+    PORT_ARGS+=(-p-)
+    PORT_SCOPE_DESC="all TCP ports (-p-)"
+fi
+
 require_sudo
 check_dependencies
 
@@ -591,7 +633,13 @@ prepare_targets
 
 TARGET_SAFE="$(safe_name "$TARGET")"
 
-DISCOVERY_PREFIX="${OUTPUT_DIR}/${TARGET_SAFE}_tcp_full"
+if [[ -n "$PORT_SPEC" ]]; then
+    DISCOVERY_SCOPE="p_$(safe_name "$PORT_SPEC")"
+else
+    DISCOVERY_SCOPE="full"
+fi
+
+DISCOVERY_PREFIX="${OUTPUT_DIR}/${TARGET_SAFE}_tcp_${DISCOVERY_SCOPE}"
 DISCOVERY_GNMAP="${DISCOVERY_PREFIX}.gnmap"
 
 SUMMARY_MD="${OUTPUT_DIR}/summary_${TIMESTAMP}.md"
@@ -603,6 +651,7 @@ echo "[+] Target: $TARGET"
 echo "[+] Parsed Nmap targets: ${NMAP_TARGET_ARGS[*]}"
 echo "[+] Timing: $TIMING"
 echo "[+] Scan type: $SCAN_TYPE_DESC"
+echo "[+] Port scope: $PORT_SCOPE_DESC"
 if [[ -n "$NMAP_EXTRA" ]]; then
     echo "[+] Extra nmap flags: $NMAP_EXTRA"
 fi
@@ -617,11 +666,11 @@ if [[ -f "$DISCOVERY_GNMAP" ]]; then
         :
     else
         echo "[+] Starting full TCP port discovery..."
-        nmap "${SCAN_TYPE_ARGS[@]}" -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+        nmap "${SCAN_TYPE_ARGS[@]}" "${PORT_ARGS[@]}" -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
     fi
 else
     echo "[+] Starting full TCP port discovery..."
-    nmap "${SCAN_TYPE_ARGS[@]}" -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+    nmap "${SCAN_TYPE_ARGS[@]}" "${PORT_ARGS[@]}" -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
 fi
 
 if [[ ! -f "$DISCOVERY_GNMAP" ]]; then

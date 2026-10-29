@@ -12,6 +12,13 @@
 #   -o, --output   Output directory. Default: nmap
 #   -f, --force    Redo scans even if output files already exist. No prompt.
 #   --reuse        Reuse existing scans if found. No prompt.
+#   --connect-scan Force -sT TCP connect scan and skip the sudo re-exec.
+#                  Required to scan through proxychains: proxychains hooks libc
+#                  connect() (used by -sT), while root -sS raw packets bypass
+#                  the tunnel and the sudo re-exec strips LD_PRELOAD.
+#                  Auto-enabled when the script runs under proxychains.
+#   --nmap-extra   Extra raw nmap flags appended to both scan phases.
+#                  Example: --nmap-extra "--script-timeout 30"
 #   -h, --help     Show help message.
 #
 # Examples:
@@ -30,6 +37,9 @@ TIMING=""
 OUTPUT_DIR="nmap"
 FORCE=false
 REUSE=false
+CONNECT_SCAN=false
+NMAP_EXTRA=""
+SCAN_TYPE_ARGS=()
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 declare -a NMAP_TARGET_ARGS
@@ -74,6 +84,15 @@ Options:
 
   --reuse        Reuse existing scans if found. No prompt.
 
+  --connect-scan Force -sT TCP connect scan and skip the sudo re-exec.
+                 Needed to scan through a proxychains tunnel: proxychains
+                 only hooks libc connect() (used by -sT), while root -sS
+                 raw packets bypass the tunnel and sudo strips LD_PRELOAD.
+                 Auto-enabled when running under proxychains.
+
+  --nmap-extra   Extra raw nmap flags appended to both scan phases.
+                 Example: --nmap-extra "--script-timeout 30"
+
   -h, --help     Show this help message.
 
 Examples:
@@ -82,10 +101,16 @@ Examples:
   sudo $0 -t '192.168.174.62,192.168.174.60' -T4
   sudo $0 -t 10.10.10.5 -T4 --force
   sudo $0 -t 10.10.10.5 -T4 --reuse
+  proxychains -q $0 -t 192.168.1.0/24 -T3 --connect-scan
 EOF
 }
 
 require_sudo() {
+    if [[ "$CONNECT_SCAN" == true ]]; then
+        echo "[+] Connect-scan mode: running without sudo (-sT TCP connect scan, proxychains-safe)."
+        return 0
+    fi
+
     if [[ "${EUID}" -ne 0 ]]; then
         echo "[!] Root privileges are required for this Nmap scan."
         echo "[+] Re-running with sudo..."
@@ -247,6 +272,7 @@ write_summary_header() {
 | Target | \`$TARGET\` |
 | Parsed targets | \`${NMAP_TARGET_ARGS[*]}\` |
 | Timing | \`$TIMING\` |
+| Scan type | \`$SCAN_TYPE_DESC\` |
 | Host discovery | \`-Pn\` used, ICMP/ping discovery bypassed |
 | Full TCP discovery | \`-p- -Pn --open\` |
 | Service detection | \`-sC -sV -Pn\` |
@@ -481,6 +507,26 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
 
+        --connect-scan|-sT)
+            CONNECT_SCAN=true
+            shift
+            ;;
+
+        --nmap-extra)
+            if [[ -z "${2:-}" ]]; then
+                echo "[!] Missing value for $1"
+                show_help
+                exit 1
+            fi
+            NMAP_EXTRA="$2"
+            shift 2
+            ;;
+
+        --nmap-extra=*)
+            NMAP_EXTRA="${1#*=}"
+            shift
+            ;;
+
         -h|--help)
             show_help
             exit 0
@@ -493,6 +539,31 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Proxychains detection: auto-enable connect-scan mode when running under a
+# proxychains tunnel. proxychains only intercepts libc connect(), which -sT
+# uses. Root -sS raw packets bypass the tunnel entirely, and the sudo re-exec
+# strips LD_PRELOAD, so a SYN scan through a tunnel stalls at 0%.
+if [[ "$CONNECT_SCAN" == false ]]; then
+    if [[ "${TOOLBOX_PROXY_MODE:-0}" == "1" || "${LD_PRELOAD:-}" == *proxychains* ]]; then
+        CONNECT_SCAN=true
+        echo "[*] Proxychains detected: enabling connect-scan mode (-sT, no sudo)."
+    fi
+fi
+
+# Scan-type arguments for both phases: -sT when connect-scan is on, plus any
+# raw extra flags from --nmap-extra.
+SCAN_TYPE_ARGS=()
+if [[ "$CONNECT_SCAN" == true ]]; then
+    SCAN_TYPE_ARGS+=("-sT")
+    SCAN_TYPE_DESC="-sT TCP connect scan (no sudo, proxychains-safe)"
+else
+    SCAN_TYPE_DESC="nmap default (root: -sS SYN scan)"
+fi
+if [[ -n "$NMAP_EXTRA" ]]; then
+    read -ra nmap_extra_flags <<< "$NMAP_EXTRA"
+    SCAN_TYPE_ARGS+=("${nmap_extra_flags[@]}")
+fi
 
 require_sudo
 check_dependencies
@@ -531,6 +602,10 @@ write_summary_header "$SUMMARY_MD" "$SUMMARY_CSV"
 echo "[+] Target: $TARGET"
 echo "[+] Parsed Nmap targets: ${NMAP_TARGET_ARGS[*]}"
 echo "[+] Timing: $TIMING"
+echo "[+] Scan type: $SCAN_TYPE_DESC"
+if [[ -n "$NMAP_EXTRA" ]]; then
+    echo "[+] Extra nmap flags: $NMAP_EXTRA"
+fi
 echo "[+] Output directory: $OUTPUT_DIR"
 echo "[+] ICMP/ping discovery bypass: enabled with -Pn"
 echo "[+] Existing file behavior: ask unless --force or --reuse is used"
@@ -542,11 +617,11 @@ if [[ -f "$DISCOVERY_GNMAP" ]]; then
         :
     else
         echo "[+] Starting full TCP port discovery..."
-        nmap -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+        nmap "${SCAN_TYPE_ARGS[@]}" -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
     fi
 else
     echo "[+] Starting full TCP port discovery..."
-    nmap -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
+    nmap "${SCAN_TYPE_ARGS[@]}" -p- -Pn --open "$TIMING" -oA "$DISCOVERY_PREFIX" "${NMAP_TARGET_ARGS[@]}"
 fi
 
 if [[ ! -f "$DISCOVERY_GNMAP" ]]; then
@@ -574,11 +649,11 @@ while read -r HOST PORTS; do
             :
         else
             echo "[+] Starting service/script scan for $HOST..."
-            nmap -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
+            nmap "${SCAN_TYPE_ARGS[@]}" -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
         fi
     else
         echo "[+] Starting service/script scan for $HOST..."
-        nmap -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
+        nmap "${SCAN_TYPE_ARGS[@]}" -sC -sV -Pn "$TIMING" -p "$PORTS" -oA "$SERVICE_PREFIX" "$HOST"
     fi
 
     if [[ -f "$SERVICE_GNMAP" ]]; then
